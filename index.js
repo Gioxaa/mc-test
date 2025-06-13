@@ -16,6 +16,12 @@ let credentials = fs.existsSync(credPath) ? fs.readJsonSync(credPath) : {};
 // Track active bots
 const activeBots = new Map();
 
+// Global rate limiting
+let currentDelay = 1500; // Start with 1.5s between connections
+let lastConnectionTime = 0;
+let rateLimitDetected = false;
+const MAX_DELAY = 30000; // Maximum 30s delay
+
 // ANSI color codes for console output
 const colors = {
   reset: '\x1b[0m',
@@ -55,23 +61,49 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Rate-limited bot creation - waits for appropriate delay before creating a bot
+async function createBotWithRateLimit(index) {
+  // Calculate time since last connection
+  const now = Date.now();
+  const timeSinceLastConnection = now - lastConnectionTime;
+  
+  // If we need to wait more, do so
+  if (timeSinceLastConnection < currentDelay) {
+    const waitTime = currentDelay - timeSinceLastConnection;
+    log('SYSTEM', `Rate limiting: waiting ${waitTime}ms before next connection`, 'warning');
+    await delay(waitTime);
+  }
+  
+  // Update last connection time and create bot
+  lastConnectionTime = Date.now();
+  return createBot(index);
+}
+
 // Creates and manages a bot
 async function createBot(index) {
   const username = `${config.prefix}${index}`;
   let reconnectAttempts = 0;
-  const maxReconnectAttempts = 5;
+  const maxReconnectAttempts = 10; // Increased from 5
   let reconnectDelay = 5000; // Start with 5 seconds
+  let loginRetries = 0;
+  const maxLoginRetries = 3;
   
   async function connect() {
     try {
       // Remove old bot if exists
       if (activeBots.has(username)) {
         const oldBot = activeBots.get(username);
-        if (oldBot && oldBot.end) oldBot.end();
+        try {
+          if (oldBot && oldBot.end) oldBot.end();
+        } catch (e) {
+          // Ignore errors while ending bot
+        }
         activeBots.delete(username);
       }
       
-      // Create new bot
+      // Create new bot with proper error handling
+      log(username, `Connecting to ${config.host}:${config.port}`, 'info');
+      
       const bot = mineflayer.createBot({
         host: config.host,
         port: config.port,
@@ -80,6 +112,9 @@ async function createBot(index) {
         keepAlive: true,
         checkTimeoutInterval: 30000,
         viewDistance: 'tiny', // Reduce network load
+        connectTimeout: 30000, // Increase connect timeout
+        respawn: true, // Auto respawn if killed
+        skipValidation: true, // Skip validation
       });
       
       activeBots.set(username, bot);
@@ -95,30 +130,41 @@ async function createBot(index) {
   }
   
   function setupEventHandlers(bot, username) {
+    // Set up error handlers first
+    bot.on('error', (err) => {
+      log(username, `Error: ${err.message}`, 'error');
+      
+      // Specifically handle ECONNRESET by marking as rate limited
+      if (err.code === 'ECONNRESET') {
+        rateLimitDetected = true;
+        // Increase global delay when we see connection resets
+        currentDelay = Math.min(currentDelay * 1.5, MAX_DELAY);
+        log('SYSTEM', `ECONNRESET detected, increasing global delay to ${currentDelay}ms`, 'warning');
+      }
+    });
+    
     // Spawn handler
     bot.once('spawn', async () => {
       log(username, 'Spawned', 'success');
       
       try {
+        // Wait a bit before trying to authenticate
+        await delay(1000 + Math.random() * 500);
+        
         // Handle authentication
         if (!credentials[username]) {
-          await delay(1000 + Math.random() * 1000);
-          bot.chat(`/register ${config.password} ${config.password}`);
-          credentials[username] = config.password;
-          fs.writeJsonSync(credPath, credentials, { spaces: 2 });
-          log(username, 'Registered', 'success');
+          await performRegistration(bot, username);
         } else {
-          await delay(1000 + Math.random() * 1000);
-          bot.chat(`/login ${credentials[username]}`);
-          log(username, 'Login attempted', 'info');
+          await performLogin(bot, username);
         }
         
-        // Start bot activities
+        // Start bot activities after successful spawn
         startBotActivities(bot, username);
         
         // Reset reconnection attempts on successful spawn
         reconnectAttempts = 0;
         reconnectDelay = 5000;
+        loginRetries = 0;
       } catch (error) {
         log(username, `Error during spawn: ${error.message}`, 'error');
       }
@@ -131,53 +177,105 @@ async function createBot(index) {
       // Log all messages
       log(username, `Chat: ${message.toString()}`, 'info');
       
+      // Check for rate limiting messages
+      if (msg.includes("logging in too fast") || msg.includes("try again later")) {
+        rateLimitDetected = true;
+        // Increase global delay when rate limited
+        currentDelay = Math.min(currentDelay * 2, MAX_DELAY);
+        log('SYSTEM', `Rate limit detected, increasing global delay to ${currentDelay}ms`, 'warning');
+      }
+      
       // Handle login success/failure messages
       if (msg.includes('success') && msg.includes('log')) {
         log(username, 'Login successful', 'success');
+        loginRetries = 0;
       } else if ((msg.includes('wrong password') || msg.includes('failed')) && msg.includes('log')) {
         log(username, 'Login failed', 'error');
+        loginRetries++;
         
-        // Try to login again after delay
-        setTimeout(() => {
-          if (bot.entity) {
-            bot.chat(`/login ${credentials[username]}`);
-            log(username, 'Retrying login...', 'warning');
-          }
-        }, 3000);
+        // Try to login again after delay if we haven't exceeded retry limit
+        if (loginRetries < maxLoginRetries) {
+          setTimeout(() => {
+            if (bot.entity) {
+              bot.chat(`/login ${credentials[username]}`);
+              log(username, `Retrying login... (${loginRetries + 1}/${maxLoginRetries})`, 'warning');
+            }
+          }, 3000);
+        } else {
+          log(username, `Max login retries (${maxLoginRetries}) reached`, 'error');
+        }
       }
     });
+    
+    // Registration handler
+    async function performRegistration(bot, username) {
+      log(username, 'Attempting registration', 'info');
+      bot.chat(`/register ${config.password} ${config.password}`);
+      credentials[username] = config.password;
+      
+      try {
+        fs.writeJsonSync(credPath, credentials, { spaces: 2 });
+        log(username, 'Registered and credentials saved', 'success');
+      } catch (err) {
+        log(username, `Failed to save credentials: ${err.message}`, 'error');
+      }
+    }
+    
+    // Login handler with retries
+    async function performLogin(bot, username) {
+      log(username, 'Attempting login', 'info');
+      bot.chat(`/login ${credentials[username]}`);
+    }
     
     // Disconnection handler
     bot.on('end', async () => {
       log(username, 'Disconnected', 'warning');
       activeBots.delete(username);
       
+      // If we're rate limited, add extra delay
+      if (rateLimitDetected) {
+        const extraDelay = Math.random() * 10000 + 5000; // 5-15s additional delay
+        log(username, `Rate limit detected, adding ${Math.round(extraDelay/1000)}s extra delay`, 'warning');
+        await delay(extraDelay);
+        rateLimitDetected = false;
+      }
+      
       // Attempt to reconnect with exponential backoff
       if (reconnectAttempts < maxReconnectAttempts) {
         reconnectAttempts++;
-        log(username, `Reconnecting in ${reconnectDelay/1000}s (Attempt ${reconnectAttempts}/${maxReconnectAttempts})`, 'warning');
+        // Add jitter to the reconnect delay to prevent all bots reconnecting at once
+        const jitter = Math.random() * 2000 - 1000; // ±1s jitter
+        const actualDelay = reconnectDelay + jitter;
+        
+        log(username, `Reconnecting in ${Math.round(actualDelay/1000)}s (Attempt ${reconnectAttempts}/${maxReconnectAttempts})`, 'warning');
         
         setTimeout(async () => {
-          await connect();
-          // Increase delay for next attempt
-          reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
-        }, reconnectDelay);
+          // Use rate-limited connect to prevent server overload
+          await createBotWithRateLimit(index);
+          // Increase delay for next attempt with a slower growth rate
+          reconnectDelay = Math.min(reconnectDelay * 1.3, 30000);
+        }, actualDelay);
       } else {
         log(username, 'Max reconnection attempts reached', 'error');
       }
     });
     
-    // Error handler
-    bot.on('error', (err) => {
-      log(username, `Error: ${err.message}`, 'error');
-    });
-    
-    // Kick handler
+    // Kick handler with specific handling for rate limiting
     bot.on('kicked', (reason, loggedIn) => {
       try {
         const parsedReason = typeof reason === 'string' ? JSON.parse(reason) : reason;
         const reasonStr = typeof parsedReason === 'object' ? JSON.stringify(parsedReason) : parsedReason;
         log(username, `Kicked: ${reasonStr}`, 'error');
+        
+        // Check for rate limiting kick messages
+        if (typeof reasonStr === 'string' && 
+            (reasonStr.includes("too fast") || reasonStr.includes("try again") || 
+             reasonStr.includes("rate") || reasonStr.includes("limit"))) {
+          rateLimitDetected = true;
+          // Double the connection delay when explicitly rate limited
+          currentDelay = Math.min(currentDelay * 2, MAX_DELAY);
+          log('SYSTEM', `Rate limit kick detected, doubling global delay to ${currentDelay}ms`, 'warning');
+        }
       } catch (e) {
         log(username, `Kicked: ${reason}`, 'error');
       }
@@ -205,7 +303,7 @@ async function createBot(index) {
     });
   }
   
-  // Start the bot behaviors
+  // Start the bot behaviors - using more conservative timings
   function startBotActivities(bot, username) {
     // Custom messages for spam
     const messages = [
@@ -222,15 +320,15 @@ async function createBot(index) {
     // More complex movements
     const moveIntervals = [];
     
-    // Jump around
+    // Jump around (less frequently)
     moveIntervals.push(setInterval(() => {
       if (bot.entity) {
         bot.setControlState('jump', true);
         setTimeout(() => bot.setControlState('jump', false), 350);
       }
-    }, 5000 + Math.random() * 7000));
+    }, 8000 + Math.random() * 5000));
     
-    // Random movement
+    // Random movement (less frequently)
     moveIntervals.push(setInterval(() => {
       if (bot.entity) {
         const movements = ['forward', 'back', 'left', 'right'];
@@ -244,15 +342,15 @@ async function createBot(index) {
         // Random look
         bot.look(Math.random() * Math.PI * 2, Math.random() * Math.PI - Math.PI/2);
       }
-    }, 3000 + Math.random() * 5000));
+    }, 5000 + Math.random() * 5000));
     
-    // Chat spam with random messages
+    // Chat spam with random messages (much less frequently)
     moveIntervals.push(setInterval(() => {
       if (bot.entity) {
         const message = messages[Math.floor(Math.random() * messages.length)];
         bot.chat(message);
       }
-    }, 10000 + Math.random() * 5000));
+    }, 15000 + Math.random() * 10000));
     
     // Clean up intervals on disconnect
     bot.once('end', () => {
@@ -264,17 +362,22 @@ async function createBot(index) {
   return await connect();
 }
 
-// Start system
+// Start system with rate limiting
 (async () => {
   try {
     // Show startup message
     log('SYSTEM', `Starting bot army for ${config.host}:${config.port}`, 'system');
     log('SYSTEM', `Targeting Minecraft ${config.version} with ${config.totalBots} bots`, 'system');
+    log('SYSTEM', `Initial connection delay: ${currentDelay}ms`, 'system');
     
-    // Launch bots with staggered timing
+    // Launch bots with rate limiting
     for (let i = config.startIndex; i < config.startIndex + config.totalBots; i++) {
-      createBot(i);
-      await delay(500 + Math.random() * 500);
+      await createBotWithRateLimit(i);
+      // Add dynamic delay based on observations
+      if (rateLimitDetected) {
+        log('SYSTEM', 'Rate limit detected, increasing connection delay', 'warning');
+        rateLimitDetected = false;
+      }
     }
     
     // Log status periodically
@@ -282,7 +385,7 @@ async function createBot(index) {
       const uptime = process.uptime();
       const minutes = Math.floor(uptime / 60);
       const seconds = Math.floor(uptime % 60);
-      log('SYSTEM', `Status: ${activeBots.size}/${config.totalBots} bots active, uptime: ${minutes}m ${seconds}s`, 'system');
+      log('SYSTEM', `Status: ${activeBots.size}/${config.totalBots} bots active, uptime: ${minutes}m ${seconds}s, current delay: ${currentDelay}ms`, 'system');
     }, 60000);
   } catch (err) {
     log('SYSTEM', `CRITICAL ERROR: ${err.message}`, 'error');
