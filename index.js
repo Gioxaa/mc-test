@@ -16,21 +16,12 @@ let credentials = fs.existsSync(credPath) ? fs.readJsonSync(credPath) : {};
 // Track active bots
 const activeBots = new Map();
 
-// Global rate limiting
-let currentDelay = 30000; // Start with 30s between connections
+// Global rate limiting - use config values
+let currentDelay = config.timing.initialConnectionDelay;
 let lastConnectionTime = 0;
 let rateLimitDetected = false;
-const MAX_DELAY = 120000; // Maximum 2 minutes delay
-let chatDisabled = true; // Assume chat is disabled by default
-
-// Server-specific settings
-const serverSettings = {
-  maxConcurrentBots: 20, // Maximum number of bots to have active at once
-  chatDisabled: true,    // Flag to track if chat is disabled
-  authTimeoutDetected: false, // Flag to track auth timeout issues
-  requiresAuth: true,    // Flag to indicate server requires authentication
-  botCount: 0,           // Current number of active bots
-};
+const MAX_DELAY = config.timing.maxConnectionDelay;
+let chatDisabled = config.behavior.assumeChatDisabled;
 
 // ANSI color codes for console output
 const colors = {
@@ -39,8 +30,7 @@ const colors = {
   green: '\x1b[32m',
   yellow: '\x1b[33m',
   blue: '\x1b[34m',
-  cyan: '\x1b[36m',
-  magenta: '\x1b[35m'
+  cyan: '\x1b[36m'
 };
 
 // Logger function with colors and file output
@@ -57,7 +47,6 @@ function log(botName, message, type = 'info') {
     else if (type === 'success') color = colors.green;
     else if (type === 'warning') color = colors.yellow;
     else if (type === 'system') color = colors.cyan;
-    else if (type === 'chat') color = colors.magenta;
     
     // Console output
     console.log(`${color}${logMessage}${colors.reset}`);
@@ -93,12 +82,12 @@ async function createBotWithRateLimit(index) {
 
 // Creates and manages a bot
 async function createBot(index) {
-  const username = `${config.prefix}${index}`;
+  const username = `${config.bots.prefix}${index}`;
   let reconnectAttempts = 0;
-  const maxReconnectAttempts = 5; // Reduced from 10
-  let reconnectDelay = 30000; // Start with 30 seconds
+  const maxReconnectAttempts = config.bots.maxReconnectAttempts;
+  let reconnectDelay = config.timing.reconnectBaseDelay;
   let loginRetries = 0;
-  const maxLoginRetries = 2; // Reduced from 3
+  const maxLoginRetries = config.bots.maxLoginRetries;
   
   async function connect() {
     try {
@@ -114,19 +103,19 @@ async function createBot(index) {
       }
       
       // Create new bot with proper error handling
-      log(username, `Connecting to ${config.host}:${config.port}`, 'info');
+      log(username, `Connecting to ${config.server.host}:${config.server.port}`, 'info');
       
       const bot = mineflayer.createBot({
-        host: config.host,
-        port: config.port,
+        host: config.server.host,
+        port: config.server.port,
         username,
-        version: config.version,
+        version: config.server.version,
         keepAlive: true,
-        checkTimeoutInterval: 60000, // Increased timeout check
-        viewDistance: 'tiny', // Reduce network load
-        connectTimeout: 60000, // Increase connect timeout
-        respawn: true, // Auto respawn if killed
-        skipValidation: true, // Skip validation
+        checkTimeoutInterval: 60000,
+        viewDistance: config.behavior.viewDistance,
+        connectTimeout: 60000,
+        respawn: config.behavior.respawnEnabled,
+        skipValidation: true,
       });
       
       activeBots.set(username, bot);
@@ -175,7 +164,7 @@ async function createBot(index) {
         
         // Reset reconnection attempts on successful spawn
         reconnectAttempts = 0;
-        reconnectDelay = 30000;
+        reconnectDelay = config.timing.reconnectBaseDelay;
         loginRetries = 0;
       } catch (error) {
         log(username, `Error during spawn: ${error.message}`, 'error');
@@ -228,8 +217,8 @@ async function createBot(index) {
     // Registration handler
     async function performRegistration(bot, username) {
       log(username, 'Attempting registration', 'info');
-      bot.chat(`/register ${config.password} ${config.password}`);
-      credentials[username] = config.password;
+      bot.chat(`/register ${config.bots.password} ${config.bots.password}`);
+      credentials[username] = config.bots.password;
       
       try {
         fs.writeJsonSync(credPath, credentials, { spaces: 2 });
@@ -271,7 +260,7 @@ async function createBot(index) {
           // Use rate-limited connect to prevent server overload
           await createBotWithRateLimit(index);
           // Increase delay for next attempt with a slower growth rate
-          reconnectDelay = Math.min(reconnectDelay * 1.5, 120000);
+          reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_DELAY);
         }, actualDelay);
       } else {
         log(username, 'Max reconnection attempts reached', 'error');
@@ -311,36 +300,38 @@ async function createBot(index) {
       }
     });
     
-    // Player tracking (reduced to minimize log spam)
-    bot.on('playerJoined', (player) => {
-      // Only log non-bot players to reduce spam
-      if (!player.username.startsWith(config.prefix)) {
-        log(username, `Player joined: ${player.username}`, 'info');
-      }
-    });
-    
-    bot.on('playerLeft', (player) => {
-      // Only log non-bot players to reduce spam
-      if (!player.username.startsWith(config.prefix)) {
-        log(username, `Player left: ${player.username}`, 'info');
-      }
-    });
+    // Player tracking (based on config)
+    if (config.logging.logPlayerMovements) {
+      bot.on('playerJoined', (player) => {
+        // Only log non-bot players to reduce spam
+        if (!player.username.startsWith(config.bots.prefix)) {
+          log(username, `Player joined: ${player.username}`, 'info');
+        }
+      });
+      
+      bot.on('playerLeft', (player) => {
+        // Only log non-bot players to reduce spam
+        if (!player.username.startsWith(config.bots.prefix)) {
+          log(username, `Player left: ${player.username}`, 'info');
+        }
+      });
+    }
   }
   
-  // Start the bot behaviors - using more conservative timings and respecting chat disabled
+  // Start the bot behaviors - using config values for timings
   function startBotActivities(bot, username) {
     // More complex movements
     const moveIntervals = [];
     
-    // Jump around (much less frequently)
+    // Jump around
     moveIntervals.push(setInterval(() => {
       if (bot.entity) {
         bot.setControlState('jump', true);
-        setTimeout(() => bot.setControlState('jump', false), 350);
+        setTimeout(() => bot.setControlState('jump', false), config.behavior.movementDuration);
       }
-    }, 15000 + Math.random() * 10000));
+    }, config.timing.jumpInterval + Math.random() * 10000));
     
-    // Random movement (less frequently)
+    // Random movement
     moveIntervals.push(setInterval(() => {
       if (bot.entity) {
         const movements = ['forward', 'back', 'left', 'right'];
@@ -349,12 +340,12 @@ async function createBot(index) {
         bot.setControlState(movement, true);
         setTimeout(() => {
           bot.setControlState(movement, false);
-        }, 500 + Math.random() * 1000);
+        }, config.behavior.movementDuration + Math.random() * 1000);
         
         // Random look
         bot.look(Math.random() * Math.PI * 2, Math.random() * Math.PI - Math.PI/2);
       }
-    }, 10000 + Math.random() * 5000));
+    }, config.timing.movementInterval + Math.random() * 5000));
     
     // Chat spam only if chat is not disabled
     if (!chatDisabled) {
@@ -374,7 +365,7 @@ async function createBot(index) {
           const message = messages[Math.floor(Math.random() * messages.length)];
           bot.chat(message);
         }
-      }, 30000 + Math.random() * 30000)); // Very infrequent chat
+      }, config.timing.chatInterval + Math.random() * 30000));
     }
     
     // Clean up intervals on disconnect
@@ -391,12 +382,12 @@ async function createBot(index) {
 (async () => {
   try {
     // Show startup message
-    log('SYSTEM', `Starting bot army for ${config.host}:${config.port}`, 'system');
-    log('SYSTEM', `Targeting Minecraft ${config.version} with ${config.totalBots} bots`, 'system');
+    log('SYSTEM', `Starting bot army for ${config.server.host}:${config.server.port}`, 'system');
+    log('SYSTEM', `Targeting Minecraft ${config.server.version} with ${config.bots.totalBots} bots`, 'system');
     log('SYSTEM', `Initial connection delay: ${Math.round(currentDelay/1000)}s`, 'system');
     
     // Launch bots with rate limiting
-    for (let i = config.startIndex; i < config.startIndex + config.totalBots; i++) {
+    for (let i = config.bots.startIndex; i < config.bots.startIndex + config.bots.totalBots; i++) {
       await createBotWithRateLimit(i);
       
       // Add dynamic delay based on observations
@@ -412,8 +403,8 @@ async function createBot(index) {
       const uptime = process.uptime();
       const minutes = Math.floor(uptime / 60);
       const seconds = Math.floor(uptime % 60);
-      log('SYSTEM', `Status: ${activeBots.size}/${config.totalBots} bots active, uptime: ${minutes}m ${seconds}s, current delay: ${Math.round(currentDelay/1000)}s`, 'system');
-    }, 60000);
+      log('SYSTEM', `Status: ${activeBots.size}/${config.bots.totalBots} bots active, uptime: ${minutes}m ${seconds}s, current delay: ${Math.round(currentDelay/1000)}s`, 'system');
+    }, config.logging.statusInterval);
   } catch (err) {
     log('SYSTEM', `CRITICAL ERROR: ${err.message}`, 'error');
     console.error(err);
